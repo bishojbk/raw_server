@@ -2,5 +2,7 @@
 name = "raw_server"
 version = "0.1.0"
 edition = "2024"
+default-run = "raw_server"
 
 [dependencies]
+tokio = { version = "1", features = ["full"] }
