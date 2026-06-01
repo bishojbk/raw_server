@@ -55,3 +55,33 @@
 - Feel the ergonomic win: declarative routes, typed extractors, automatic JSON serialization.
 - The capability is the same (we're still on tokio). What changes is the abstraction level.
 - Open question: when we write `async fn handler(Json(body): Json<User>) -> ...` in axum, what is the framework doing for us that we'd otherwise hand-roll?
+
+## 2026-05-27 — Phase 2, Session 5: axum (the framework)
+
+- axum is sugar on top of tokio. Same concurrency, far less code per route.
+- Handler = async fn whose return type implements IntoResponse. Strings, JSON, tuples of (StatusCode, body), Results — all map to HTTP responses.
+- Extractor = parameter type that implements FromRequest. Path<T>, Json<T>, State<T> are extractors. axum runs them against the request to populate handler parameters; failure → automatic 4xx without the handler running.
+- The declarative-binding pattern strikes again: clap for args, serde for JSON, axum for HTTP requests. Same shape — declare the type, library does the parsing and validation.
+- Routes: Router::new().route("/path", get(handler)). Same path can chain methods: .route("/users", get(list).post(create)).
+- axum 0.7.9 wants `{id}` for path params, not `:id` (that was the 0.6 syntax). Read the panic message — it told us exactly what to do.
+- Shared mutable state across async handlers: Arc<Mutex<T>>. Arc lets many owners share; Mutex provides exclusive access; tokio::sync::Mutex (not std) is the async-aware version that yields the task instead of blocking the thread.
+- type AppState = Arc<Mutex<HashMap<u32, User>>> — type aliases keep the long type readable everywhere.
+- State extractor: handlers get the shared state via State<AppState>. State created in main, attached via .with_state(state) on the router, extracted in handlers.
+- Mutex guards release on drop (RAII). Forgetting to unlock is impossible — the unlock happens automatically when the guard goes out of scope.
+- Result<Json<T>, StatusCode> as a return type lets handlers cleanly express "200 with body OR 4xx status." `?` works inside handlers if the return type allows.
+- HashMap doesn't preserve insertion order — iteration order is determined by hashing. BTreeMap sorts by key; Vec preserves insertion order; real APIs usually sort explicitly before returning.
+- Gotcha: axum's panic at runtime if route syntax is wrong is a good design choice — better to fail loudly at startup than to silently 404 every request.
+
+## Phase 2 — complete
+
+- raw_server: HTTP/1.1 server with routing, JSON, shared state, concurrent connections.
+- Built bottom-up: TCP listener → manual HTTP parsing → routing → async with tokio → axum.
+- Every abstraction layer is now visible. axum doesn't feel magic because we wrote what it replaces.
+- Architectural shape: pure logic / async glue / HTTP transport. Same as loggrep's shape but transport is HTTP not stdin.
+
+## Next: Phase 3 — Persistence (Postgres via sqlx)
+
+- Replace the HashMap with a real database.
+- Connection pooling, schema, migrations, transactions.
+- The Mutex disappears (the DB handles concurrency).
+- Open question: when the server holds 100 concurrent requests all needing the DB, why isn't a single connection enough?
