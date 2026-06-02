@@ -85,3 +85,98 @@
 - Connection pooling, schema, migrations, transactions.
 - The Mutex disappears (the DB handles concurrency).
 - Open question: when the server holds 100 concurrent requests all needing the DB, why isn't a single connection enough?
+
+## 2026-05-31 — Phase 3, Session 1: Database concepts, Postgres setup
+
+- A database is a separate server process that listens on a port (5432 for Postgres) and speaks its own wire protocol over TCP. Mechanically the same shape as your HTTP server.
+- Connections are EXPENSIVE: TCP handshake + auth + per-connection memory on the server. ~50-200ms each. Postgres caps total connections (default 100).
+- Connection pool: app maintains a small pool of long-lived connections, hands them out to handlers, takes them back. 10-20 connections can serve hundreds of concurrent requests because each query is microseconds.
+- This is the answer to the open question — Mutex disappears because (1) Postgres handles concurrency via MVCC internally, (2) the pool itself is the concurrency primitive that handlers share via Arc.
+- Pattern is universal: connection pools to DBs, HTTP client pools to upstreams, worker pools for jobs. Finite resource, transient borrowers, bounded concurrency.
+- Postgres in Docker: clean isolation, version-pinned (postgres:16), recreatable. Real production runs either Docker or managed services (RDS/Supabase).
+- Gotcha: port 5432 was occupied by another project's stale container. Moved our DB to port 5433 to avoid the fight. Non-default ports are also a small security-hygiene habit.
+- Schema basics: CREATE TABLE with columns, types, NOT NULL, UNIQUE, PRIMARY KEY. SERIAL is shorthand for auto-incrementing integer backed by a sequence. TIMESTAMPTZ stores UTC and converts on output — always use it, never plain TIMESTAMP.
+- PRIMARY KEY and UNIQUE create backing indexes automatically. Other indexes are explicit. btree is the default index type — O(log n) lookups, ranges, ordering.
+- Sequences live outside transactions: a rolled-back insert still consumes its id. Postgres ids can have gaps. Don't rely on contiguity.
+
+## Next: Phase 3, Session 2 — sqlx, first query from Rust
+
+- Pull sqlx into Cargo.toml with the postgres + tokio features.
+- Connect to the DB from Rust. PgPool as shared state instead of Arc<Mutex<HashMap>>.
+- Compile-time-checked queries: sqlx::query! / query_as! macros validate SQL against the live DB at build time.
+- Open question: how can a Rust macro check SQL against a real database during compilation? What's it actually doing?
+
+## 2026-06-01 — Phase 3, Session 2: sqlx, real database-backed CRUD
+
+- sqlx is the standard async DB library. Its signature feature: compile-time SQL checking (query!/query_as! macros connect to the live DB at build time, run PREPARE, and type-check the query). We used the runtime query_as (no !) this session; macros next.
+- PgPool::connect(&url) opens the connection pool. PgPool is Clone + internally reference-counted — no Arc/Mutex wrapper needed. It IS the shared state now.
+- DATABASE_URL env var (postgres://user:pass@host:port/db) tells sqlx where the DB is. Stored in .env, gitignored. Exported in shell for cargo build.
+- #[derive(sqlx::FromRow)] maps a query result row into a struct by matching column names to field names.
+- query*as::<*, User>("SQL").bind(x).bind(y).<fetch>(&pool).await is the core pattern.
+- Three fetch shapes: fetch_all -> Vec<T>; fetch_optional -> Option<T> (maps cleanly to 404); fetch_one -> T (errors on 0 or >1 rows). execute -> rows-affected count for writes without RETURNING.
+- $1, $2 placeholders + .bind() = parameterized queries = SQL-injection-safe. NEVER string-interpolate user input into SQL.
+- RETURNING (Postgres) makes INSERT return the created row including auto-generated id and created_at — no separate SELECT needed.
+- Error mapping: sqlx::Error is an enum. The Database(db_err) variant has helpers like is_unique_violation(). Map unique violations to 409 Conflict (client error), everything else to 500 (server error). Returning the right status code matters — clients build retry logic on it.
+- Confirmed: failed insert (duplicate email) still consumed an id from the sequence — ids went 1,2,3,5 (4 was the rejected insert). Sequences don't recycle. Gaps are normal.
+- TIMESTAMPTZ -> chrono::DateTime<Utc> -> ISO-8601 JSON string, all via derives. Five layers of conversion, zero hand-written code.
+
+## Next: Phase 3, Session 3 — compile-time checked queries + migrations
+
+- Switch from query_as (runtime) to query_as! (compile-time checked). Feel SQL errors become build errors.
+- Install sqlx-cli. Set up migrations (versioned schema changes) instead of hand-running CREATE TABLE in psql.
+- Open question: if sqlx checks queries against the live DB at compile time, how does CI build the project without a running database? (Answer involves `cargo sqlx prepare` and offline mode.)
+
+## 2026-06-01 — Phase 3, Session 3: migrations + compile-time checked queries
+
+### Migrations (sqlx-cli)
+
+- Migrations = versioned SQL scripts committed to the repo that evolve the schema step by step. Each runs exactly once, in timestamp order, tracked in the \_sqlx_migrations table.
+- Why: hand-typed CREATE TABLE in psql lives only on your laptop. Migrations let teammates, CI, and production all reach an identical schema from code.
+- sqlx-cli: `cargo install sqlx-cli --no-default-features --features postgres`. Reads DATABASE_URL.
+- `sqlx migrate add <name>` creates migrations/<timestamp>\_<name>.sql. Put schema SQL in it. `sqlx migrate run` applies all pending.
+- Idempotent: re-running migrate run does nothing if all are applied (sees them in \_sqlx_migrations). Safe to run on every deploy.
+- Debugged a failed migration: pre-existing hand-made `users` table blocked CREATE TABLE ("already exists"). Diagnosed via \dt and SELECT from \_sqlx_migrations (0 rows = nothing applied = clean failure, nothing to roll back). Fix: DROP the conflicting table, re-run.
+- Hard-won: `sqlx`/`docker`/`cargo` are SHELL commands (prompt %). SQL and \dt are psql commands (prompt #) — run inside psql or via psql -c "...". Pasting a shell command into psql just hangs it waiting for a semicolon.
+
+### Compile-time checked queries (query_as! macro)
+
+- query_as!(StructType, "SQL", bind1, bind2) — struct is first macro arg, binds are TRAILING macro args (not .bind() chains). The `!` is the difference.
+- At COMPILE time the macro connects to the live DB (via DATABASE_URL), runs PREPARE, gets the real column names + types from Postgres, and generates type-checked code. This is the answer to the old open question: the macro delegates to Postgres, the authority on what the SQL means.
+- Proved it: typo'd `email`->`eail` in the Rust source → `cargo build` FAILED with Postgres's "column does not exist" error, attributed to the line in main.rs. No binary produced. Same bug that would've been a runtime 500 with the non-macro form, caught at build time instead.
+- The macro generates row mapping itself — #[derive(sqlx::FromRow)] no longer needed (harmless to keep).
+- TRADEOFF: build now depends on a reachable DB with current schema. Teammates/CI without a DB can't build. Fix is `cargo sqlx prepare` → caches query metadata into .sqlx/ (committed to repo) for offline builds. NOT YET DONE.
+- Detail: a single multi-row INSERT evaluates NOW() once, so all rows share an identical created_at timestamp.
+
+## Next: Phase 3, Session 4 — offline query cache + maybe UPDATE/DELETE
+
+- `cargo sqlx prepare` for offline/CI builds (.sqlx cache). Understand why CI can't hit the dev DB.
+- Add UPDATE (PUT/PATCH) and DELETE handlers to complete CRUD — .execute() and rows-affected.
+- Then Session 5: indexes, EXPLAIN/query plans, the N+1 problem.
+
+## 2026-06-01 — Phase 3, Session 4: offline query cache + full CRUD (UPDATE/DELETE)
+
+### Offline query cache (cargo sqlx prepare)
+
+- query_as!/query! need a live DB at compile time. That breaks teammates without a DB, CI containers, offline builds.
+- `cargo sqlx prepare` runs all macros against the live DB once, caches the metadata (columns, types, param types, nullability) as JSON in .sqlx/. COMMIT .sqlx/ to the repo (it's not secret — .env is secret and stays gitignored; .sqlx travels with the code).
+- Build logic: if DATABASE_URL is set → validate against live DB. If not → fall back to .sqlx/ cache. Either way still type-checked, just against a snapshot.
+- Proved offline mode: `unset DATABASE_URL; touch src/main.rs; cargo build` → compiled fine using the cache.
+- Tradeoff: change a query or schema → must re-run `cargo sqlx prepare` and commit the new cache. Teams enforce with `cargo sqlx prepare --check` in CI (fails if cache is stale).
+- The cached JSON demystifies the "magic": it's literally Postgres's description of each query. nullability in the schema (NOT NULL) flows into whether the macro generates String vs Option<String>. Schema constraints become Rust types.
+
+### Full CRUD (UPDATE + DELETE)
+
+- query! (no struct arg) for statements that don't return rows. query_as! when you map rows to a struct.
+- .execute(&pool) for non-returning statements → returns a result with .rows_affected() (u64).
+- DELETE pattern: execute, then rows_affected() == 0 → 404 (nothing was there), else → 204 No Content (success, no body). Without the rows-affected check you'd falsely report success for deleting a nonexistent row.
+- UPDATE pattern: UPDATE ... SET ... WHERE id = $n RETURNING ... + .fetch_optional. If WHERE matches no row, RETURNING returns nothing → None → 404. If it matches → updated row → 200. Option encodes existence again.
+- UPDATE can also violate UNIQUE (changing a row's email to one another row owns) → same is_unique_violation() → 409. Hit this for real in testing.
+- Confirmed an update keeps id and created_at constant, changes only name/email. An update is not a new row.
+- Routes chain methods per path: get(get_user).put(update_user).delete(delete_user). PUT = full replace, PATCH = partial (we did PUT).
+- Final CRUD status-code table: GET list 200 / GET one 200|404 / POST 201|409 / PUT 200|404|409 / DELETE 204|404, all with 500 as the genuine-server-error fallback.
+
+## Next: Phase 3, Session 5 — indexes, query plans, N+1
+
+- EXPLAIN / EXPLAIN ANALYZE: read a query plan, see seq scan vs index scan.
+- Add an index, watch the plan change, measure the difference.
+- The N+1 problem: why "list users then fetch each one's orders in a loop" collapses, and how a JOIN or batched query fixes it. Needs a second table (orders) with a foreign key — so this session also introduces relations.
